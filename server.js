@@ -104,13 +104,30 @@ wss.on('connection', async (client, req) => {
     if (total >= maxSeconds) shutdown(4003, 'credits epuises');
   }, 2000);
 
+  // Outil RAG : le modèle appelle search_course(query) → on interroge Veridy (recherche
+  // sémantique dans le cours) → on renvoie les extraits. Donne au tuteur VOCAL la même
+  // profondeur que le tuteur écrit (au-delà du résumé d'instructions, cap 12k).
+  const searchTool = {
+    type: 'function',
+    name: 'search_course',
+    description: 'Recherche sémantique dans le contenu complet du cours. Renvoie les extraits les plus pertinents. À appeler AVANT de répondre à toute question portant sur le contenu du cours.',
+    parameters: {
+      type: 'object',
+      properties: { query: { type: 'string', description: 'la question ou les mots-clés à rechercher dans le cours' } },
+      required: ['query'],
+    },
+  };
+  const toolDirective = "\n\nOUTIL: tu disposes de search_course(query) qui renvoie des extraits du cours. Pour TOUTE question sur le contenu, appelle d'abord search_course, puis fonde ta réponse UNIQUEMENT sur les extraits renvoyés. Ne lis pas les repères [n] à voix haute. Si aucun extrait pertinent, dis-le simplement.";
+
   oai.on('open', () => {
     // Config de session GA : session.type='realtime', formats audio en objet {type:'audio/pcm',rate:24000}.
     oai.send(JSON.stringify({
       type: 'session.update',
       session: {
         type: 'realtime',
-        instructions: cfg.instructions,
+        instructions: cfg.instructions + toolDirective,
+        tools: [searchTool],
+        tool_choice: 'auto',
         audio: {
           input: { format: { type: 'audio/pcm', rate: 24000 }, turn_detection: { type: 'server_vad' } },
           output: { format: { type: 'audio/pcm', rate: 24000 }, voice: cfg.voice },
@@ -123,10 +140,37 @@ wss.on('connection', async (client, req) => {
   const DEBUG = process.env.PROXY_DEBUG === '1';
   const seenTypes = new Set();
   let audioDeltas = 0;
+
+  // Exécute un appel d'outil du modèle : search_course → Veridy RAG → renvoie les extraits + relance une réponse.
+  // Protocole GA (validé) : event response.function_call_arguments.done {call_id,name,arguments} →
+  // conversation.item.create {type:'function_call_output',call_id,output} → response.create.
+  async function handleToolCall(ev) {
+    let query = '';
+    try { query = String(JSON.parse(ev.arguments || '{}').query || '').trim(); } catch { /* args malformés */ }
+    let passages = [];
+    if (query) {
+      try { const r = await veridyPost('/api/internal/course-search', { courseId, query, k: 6 }); passages = Array.isArray(r.passages) ? r.passages : []; }
+      catch (e) { console.error('[course-search]', String(e).slice(0, 120)); }
+    }
+    const output = passages.length
+      ? passages.map((p, i) => `[${i + 1}] ${p}`).join('\n\n')
+      : 'Aucun extrait pertinent trouvé dans le cours.';
+    if (DEBUG) console.log(`[tool] search_course(${JSON.stringify(query)}) → ${passages.length} extrait(s)`);
+    if (oai.readyState === 1) {
+      oai.send(JSON.stringify({ type: 'conversation.item.create', item: { type: 'function_call_output', call_id: ev.call_id, output } }));
+      oai.send(JSON.stringify({ type: 'response.create' }));
+    }
+  }
+
   oai.on('message', (data) => {
     let ev; try { ev = JSON.parse(data.toString()); } catch { return; }
     // DEBUG : logue chaque type d'event OpenAI rencontré une fois (révèle le vrai protocole GA au 1er test).
     if (DEBUG && ev.type && !seenTypes.has(ev.type)) { seenTypes.add(ev.type); console.log('[oai event]', ev.type); }
+    // Appel d'outil terminé → exécuter le RAG et renvoyer le résultat au modèle.
+    if (ev.type === 'response.function_call_arguments.done' && ev.name === 'search_course') {
+      handleToolCall(ev).catch((e) => console.error('[tool]', String(e).slice(0, 150)));
+      return;
+    }
     // GA : audio sortant = response.output_audio.delta (base64 pcm16) → binaire vers le navigateur.
     const delta = ev.delta || ev.audio;
     if ((ev.type === 'response.output_audio.delta' || ev.type === 'response.audio.delta') && typeof delta === 'string') {
