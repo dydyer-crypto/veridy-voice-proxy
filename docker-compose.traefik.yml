@@ -1,0 +1,31 @@
+# Déploiement derrière un Traefik existant (cas du VPS Hostinger : Traefik en réseau host,
+# entrypoints web/websecure, certresolver "letsencrypt", exposedbydefault=false).
+# TLS + wss gérés automatiquement par Traefik via les labels — aucun nginx/certbot.
+#
+#   docker compose -f docker-compose.traefik.yml up -d --build
+#
+# Prérequis : .env (VERIDY_VOICE_PROXY_SECRET, VERIDY_API_URL) et DNS voice.quantumaiaa.fr → IP du VPS.
+# NB : la clé OpenAI n'est PAS requise ici — le proxy la récupère depuis Veridy (canal interne).
+#      (Optionnel : OPENAI_API_KEY dans .env pour forcer une clé locale.)
+
+services:
+  voice-proxy:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      PORT: "8787"
+      PROXY_DEBUG: "1"          # logs verbeux pour le 1er test ; passer à 0 ensuite
+    ports:
+      - "127.0.0.1:8787:8787"   # accès local pour le health-check (curl), non public
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=veridy-voice"
+      - "traefik.http.routers.veridyvoice.rule=Host(`voice.quantumaiaa.fr`)"
+      - "traefik.http.routers.veridyvoice.entrypoints=websecure"
+      - "traefik.http.routers.veridyvoice.tls.certresolver=letsencrypt"
+      - "traefik.http.services.veridyvoice.loadbalancer.server.port=8787"
+
+networks:
+  default:
+    name: veridy-voice          # nom déterministe → correspond au label traefik.docker.network
