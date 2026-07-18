@@ -87,7 +87,8 @@ wss.on('connection', async (client, req) => {
   const elapsed = () => Math.round((Date.now() - started) / 1000);
   const flush = async (extra = 0) => { const total = elapsed(); const delta = total - consumed + extra; consumed = total; if (delta > 0 && buyer) { try { await veridyPost('/api/internal/voice-consume', { courseId, buyer, seconds: delta }); } catch { /* best-effort */ } } };
 
-  const oai = new WebSocket(`${OPENAI_URL}?model=${encodeURIComponent(cfg.model)}`, { headers: { Authorization: `Bearer ${OPENAI_KEY}`, 'OpenAI-Beta': 'realtime=v1' } });
+  // API GA : PAS de header OpenAI-Beta (rejeté « beta_api_shape_disabled »).
+  const oai = new WebSocket(`${OPENAI_URL}?model=${encodeURIComponent(cfg.model)}`, { headers: { Authorization: `Bearer ${OPENAI_KEY}` } });
 
   const shutdown = (code, msg) => {
     if (closed) return; closed = true;
@@ -104,14 +105,15 @@ wss.on('connection', async (client, req) => {
   }, 2000);
 
   oai.on('open', () => {
-    // Config de session GA : instructions + audio pcm16 + VAD serveur. (Ajuster ici si l'API évolue.)
+    // Config de session GA : session.type='realtime', formats audio en objet {type:'audio/pcm',rate:24000}.
     oai.send(JSON.stringify({
       type: 'session.update',
       session: {
+        type: 'realtime',
         instructions: cfg.instructions,
         audio: {
-          input: { format: 'pcm16', transcription: { model: 'whisper-1' }, turn_detection: { type: 'server_vad' } },
-          output: { format: 'pcm16', voice: cfg.voice },
+          input: { format: { type: 'audio/pcm', rate: 24000 }, turn_detection: { type: 'server_vad' } },
+          output: { format: { type: 'audio/pcm', rate: 24000 }, voice: cfg.voice },
         },
       },
     }));
@@ -125,10 +127,9 @@ wss.on('connection', async (client, req) => {
     let ev; try { ev = JSON.parse(data.toString()); } catch { return; }
     // DEBUG : logue chaque type d'event OpenAI rencontré une fois (révèle le vrai protocole GA au 1er test).
     if (DEBUG && ev.type && !seenTypes.has(ev.type)) { seenTypes.add(ev.type); console.log('[oai event]', ev.type); }
-    // Audio sortant (base64 pcm16) → binaire vers le navigateur. Tolère plusieurs noms d'events GA.
-    const isAudioDelta = /(^|\.)(output_)?audio\.delta$/.test(ev.type || '') || (ev.type === 'response.audio.delta');
+    // GA : audio sortant = response.output_audio.delta (base64 pcm16) → binaire vers le navigateur.
     const delta = ev.delta || ev.audio;
-    if (isAudioDelta && typeof delta === 'string') {
+    if ((ev.type === 'response.output_audio.delta' || ev.type === 'response.audio.delta') && typeof delta === 'string') {
       audioDeltas++; if (DEBUG && audioDeltas === 1) console.log('[oai] premier chunk audio reçu ✓');
       if (client.readyState === 1) client.send(Buffer.from(delta, 'base64'));
     } else if (/audio_transcript\.delta$/.test(ev.type || '') && ev.delta) {
